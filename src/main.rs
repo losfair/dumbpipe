@@ -245,11 +245,19 @@ pub struct ConnectUnixArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct RemoteAllowlistArgs {
-    /// Only accept connections from this remote endpoint id.
+    /// Only accept connections from this z32 remote endpoint id.
     ///
     /// May be repeated. If omitted, connections from any remote endpoint id are accepted.
-    #[clap(long = "allow-remote", value_name = "ENDPOINT_ID")]
+    #[clap(
+        long = "allow-remote",
+        value_name = "Z32_ENDPOINT_ID",
+        value_parser = parse_endpoint_id_z32
+    )]
     pub allowed_remote_endpoint_ids: Vec<EndpointId>,
+}
+
+fn parse_endpoint_id_z32(endpoint_id: &str) -> std::result::Result<EndpointId, String> {
+    EndpointId::from_z32(endpoint_id).map_err(|err| err.to_string())
 }
 
 fn ensure_remote_endpoint_allowed(
@@ -261,6 +269,10 @@ fn ensure_remote_endpoint_allowed(
         "remote endpoint id {remote_endpoint_id} is not allowlisted"
     );
     Ok(())
+}
+
+fn format_endpoint_id(endpoint_id: EndpointId) -> String {
+    endpoint_id.to_z32()
 }
 
 #[cfg(test)]
@@ -289,6 +301,21 @@ mod tests {
         assert!(
             ensure_remote_endpoint_allowed(remote_endpoint_id, &[allowed_endpoint_id]).is_err()
         );
+    }
+
+    #[test]
+    fn parse_endpoint_id_z32_accepts_displayed_endpoint_id() {
+        let endpoint_id = SecretKey::generate().public();
+        let formatted = format_endpoint_id(endpoint_id);
+
+        assert_eq!(parse_endpoint_id_z32(&formatted).unwrap(), endpoint_id);
+    }
+
+    #[test]
+    fn parse_endpoint_id_z32_rejects_hex_endpoint_id() {
+        let endpoint_id = SecretKey::generate().public();
+
+        assert!(parse_endpoint_id_z32(&endpoint_id.to_string()).is_err());
     }
 }
 
@@ -429,7 +456,10 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
     // print the ticket on stderr so it doesn't interfere with the data itself
     //
     // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Listening. To connect, use:\ndumbpipe connect {ticket}");
+    eprintln!(
+        "Listening on endpoint id {}. To connect, use:\ndumbpipe connect {ticket}",
+        format_endpoint_id(endpoint.id())
+    );
     if args.common.verbose > 0 {
         eprintln!("or:\ndumbpipe connect {short}");
     }
@@ -489,6 +519,7 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
 async fn connect_stdio(args: ConnectArgs) -> Result<()> {
     let secret_key = get_or_create_secret()?;
     let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
+    eprintln!("local endpoint id is {}", format_endpoint_id(endpoint.id()));
     let addr = args.ticket.endpoint_addr();
     let remote_endpoint_id = addr.id;
     // connect to the remote, try only once
@@ -531,6 +562,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
     let endpoint = create_endpoint(secret_key, &args.common, vec![])
         .await
         .std_context("unable to bind endpoint")?;
+    eprintln!("local endpoint id is {}", format_endpoint_id(endpoint.id()));
     tracing::info!("tcp listening on {:?}", addrs);
 
     // Wait for our own endpoint to be ready before trying to connect.
@@ -622,7 +654,11 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
     // print the ticket on stderr so it doesn't interfere with the data itself
     //
     // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Forwarding incoming requests to '{}'.", args.host);
+    eprintln!(
+        "Forwarding incoming requests to '{}' from endpoint id {}.",
+        args.host,
+        format_endpoint_id(endpoint.id())
+    );
     eprintln!("To connect, use e.g.:");
     eprintln!("dumbpipe connect-tcp {ticket}");
     if args.common.verbose > 0 {
@@ -727,8 +763,9 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
     //
     // note that the tests rely on the ticket being the last thing printed
     eprintln!(
-        "Forwarding incoming requests to '{}'.",
-        socket_path.display()
+        "Forwarding incoming requests to '{}' from endpoint id {}.",
+        socket_path.display(),
+        format_endpoint_id(endpoint.id())
     );
     eprintln!("To connect, use e.g.:");
     eprintln!("dumbpipe connect-unix --socket-path /path/to/client.sock {ticket}");
@@ -845,6 +882,7 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
     let endpoint = create_endpoint(secret_key, &args.common, vec![])
         .await
         .std_context("unable to bind endpoint")?;
+    eprintln!("local endpoint id is {}", format_endpoint_id(endpoint.id()));
     tracing::info!("unix listening on {:?}", socket_path);
 
     // Wait for our own endpoint to be ready before trying to connect.

@@ -159,7 +159,7 @@ dumbpipe connect-tcp --addr 127.0.0.1:8080 <ticket>
 
 ## Allowlisting remote endpoint ids
 
-Listener commands can restrict incoming iroh connections to known remote endpoint ids:
+Listener commands can restrict incoming iroh connections to known remote endpoint ids encoded as z32:
 
 ```bash
 dumbpipe listen-tcp --host localhost:3000 --allow-remote <endpoint-id>
@@ -167,7 +167,7 @@ dumbpipe listen-tcp --host localhost:3000 --allow-remote <endpoint-id>
 
 Repeat `--allow-remote` to allow multiple remotes. If the flag is not set, listener commands accept connections from any remote endpoint id.
 
-When the connecting side uses a stable `IROH_SECRET`, `dumbpipe generate-ticket` prints a ticket whose endpoint id can be used in the listener allowlist.
+When the connecting side uses a stable `IROH_SECRET`, its startup output shows the z32 endpoint id that can be used in the listener allowlist.
 
 ## Custom ALPNs
 
