@@ -145,6 +145,17 @@ ZELLIJ_SOCKET_DIR=/tmp/zj-remote zellij attach remote-task-1234
 
 # Advanced features
 
+## Mainline DHT publishing
+
+Listener commands publish their iroh endpoint address to the BitTorrent Mainline
+DHT using `iroh-mainline-address-lookup`. By default, only relay addresses are
+published, not direct IP addresses. This lets DHT-aware clients resolve the
+listener from its endpoint id.
+
+Pass `--dht-only` to use Mainline DHT as the only iroh address lookup service.
+On connector commands, this also ignores relay/direct addresses embedded in the
+ticket so the remote address must come from DHT lookup.
+
 ## Combining Listeners
 
 You can mix and match listeners. For example, forward from a remote Unix socket to a local TCP port:

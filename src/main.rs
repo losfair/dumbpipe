@@ -10,8 +10,9 @@ use clap::{Parser, Subcommand};
 use dumbpipe::EndpointTicket;
 use iroh::{
     endpoint::{presets, Accepting},
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey,
 };
+use iroh_mainline_address_lookup::DhtAddressLookup;
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -139,6 +140,14 @@ pub struct CommonArgs {
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Only use Mainline DHT for iroh address lookup.
+    ///
+    /// This disables the n0 DNS/pkarr lookup services from the default iroh
+    /// preset while keeping default relay transport enabled. Connector commands
+    /// also ignore relay/direct addresses embedded in tickets.
+    #[clap(long)]
+    pub dht_only: bool,
 }
 
 impl CommonArgs {
@@ -275,6 +284,14 @@ fn format_endpoint_id(endpoint_id: EndpointId) -> String {
     endpoint_id.to_z32()
 }
 
+fn endpoint_addr_from_ticket(ticket: &EndpointTicket, dht_only: bool) -> EndpointAddr {
+    if dht_only {
+        EndpointAddr::new(ticket.endpoint_addr().id)
+    } else {
+        ticket.endpoint_addr().clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +333,30 @@ mod tests {
         let endpoint_id = SecretKey::generate().public();
 
         assert!(parse_endpoint_id_z32(&endpoint_id.to_string()).is_err());
+    }
+
+    #[test]
+    fn dht_only_ticket_addr_drops_embedded_addresses() {
+        let endpoint_id = SecretKey::generate().public();
+        let relay_url = "https://example.com".parse().unwrap();
+        let ticket = EndpointTicket::new(EndpointAddr::new(endpoint_id).with_relay_url(relay_url));
+
+        let addr = endpoint_addr_from_ticket(&ticket, true);
+
+        assert_eq!(addr.id, endpoint_id);
+        assert_eq!(addr.relay_urls().count(), 0);
+    }
+
+    #[test]
+    fn default_ticket_addr_keeps_embedded_addresses() {
+        let endpoint_id = SecretKey::generate().public();
+        let relay_url = "https://example.com".parse().unwrap();
+        let ticket = EndpointTicket::new(EndpointAddr::new(endpoint_id).with_relay_url(relay_url));
+
+        let addr = endpoint_addr_from_ticket(&ticket, false);
+
+        assert_eq!(addr.id, endpoint_id);
+        assert_eq!(addr.relay_urls().count(), 1);
     }
 }
 
@@ -389,10 +430,22 @@ async fn create_endpoint(
     secret_key: SecretKey,
     common: &CommonArgs,
     alpns: Vec<Vec<u8>>,
+    publish_dht: bool,
 ) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .alpns(alpns);
+    let mut builder = if common.dht_only {
+        Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default)
+    } else {
+        Endpoint::builder(presets::N0)
+    }
+    .secret_key(secret_key)
+    .alpns(alpns);
+    if publish_dht || common.dht_only {
+        let mut address_lookup = DhtAddressLookup::builder();
+        if !publish_dht {
+            address_lookup = address_lookup.no_publish();
+        }
+        builder = builder.address_lookup(address_lookup);
+    }
     if let Some(addr) = common.ipv4_addr {
         builder = builder.bind_addr(addr)?;
     }
@@ -444,7 +497,8 @@ async fn forward_bidi(
 
 async fn listen_stdio(args: ListenArgs) -> Result<()> {
     let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
+    let endpoint =
+        create_endpoint(secret_key, &args.common, vec![args.common.alpn()?], true).await?;
     // wait for the endpoint to figure out its home relay and addresses before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
         eprintln!("Warning: Failed to connect to the home relay");
@@ -518,9 +572,9 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
 
 async fn connect_stdio(args: ConnectArgs) -> Result<()> {
     let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
+    let endpoint = create_endpoint(secret_key, &args.common, vec![], false).await?;
     eprintln!("local endpoint id is {}", format_endpoint_id(endpoint.id()));
-    let addr = args.ticket.endpoint_addr();
+    let addr = endpoint_addr_from_ticket(&args.ticket, args.common.dht_only);
     let remote_endpoint_id = addr.id;
     // connect to the remote, try only once
     let connection = endpoint
@@ -559,16 +613,11 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         .to_socket_addrs()
         .std_context(format!("invalid host string {}", args.addr))?;
     let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![])
+    let endpoint = create_endpoint(secret_key, &args.common, vec![], false)
         .await
         .std_context("unable to bind endpoint")?;
     eprintln!("local endpoint id is {}", format_endpoint_id(endpoint.id()));
     tracing::info!("tcp listening on {:?}", addrs);
-
-    // Wait for our own endpoint to be ready before trying to connect.
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
 
     let tcp_listener = match tokio::net::TcpListener::bind(addrs.as_slice()).await {
         Ok(tcp_listener) => tcp_listener,
@@ -577,6 +626,14 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
             return Ok(());
         }
     };
+
+    // Wait for our own endpoint to be ready before trying to connect, but only
+    // after the local TCP port is bound so clients can queue while startup
+    // completes.
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+
     async fn handle_tcp_accept(
         next: io::Result<(tokio::net::TcpStream, SocketAddr)>,
         addr: EndpointAddr,
@@ -609,7 +666,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         forward_bidi(tcp_recv, tcp_send, endpoint_recv, endpoint_send).await?;
         Ok::<_, AnyError>(())
     }
-    let addr = args.ticket.endpoint_addr();
+    let addr = endpoint_addr_from_ticket(&args.ticket, args.common.dht_only);
     loop {
         // also wait for ctrl-c here so we can use it before accepting a connection
         let next = tokio::select! {
@@ -642,7 +699,8 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         Err(e) => bail_any!("invalid host string {}: {}", args.host, e),
     };
     let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
+    let endpoint =
+        create_endpoint(secret_key, &args.common, vec![args.common.alpn()?], true).await?;
     // wait for the endpoint to figure out its address before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
         eprintln!("Warning: Failed to connect to the home relay");
@@ -750,7 +808,8 @@ fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
 async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
     let socket_path = args.socket_path.clone();
     let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
+    let endpoint =
+        create_endpoint(secret_key, &args.common, vec![args.common.alpn()?], true).await?;
     // wait for the endpoint to figure out its address before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
         eprintln!("Warning: Failed to connect to the home relay");
@@ -879,16 +938,11 @@ impl Drop for UnixSocketGuard {
 async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
     let socket_path = args.socket_path.clone();
     let secret_key = get_or_create_secret()?;
-    let endpoint = create_endpoint(secret_key, &args.common, vec![])
+    let endpoint = create_endpoint(secret_key, &args.common, vec![], false)
         .await
         .std_context("unable to bind endpoint")?;
     eprintln!("local endpoint id is {}", format_endpoint_id(endpoint.id()));
     tracing::info!("unix listening on {:?}", socket_path);
-
-    // Wait for our own endpoint to be ready before trying to connect.
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
 
     // Remove existing socket file if it exists
     if let Err(e) = tokio::fs::remove_file(&socket_path).await {
@@ -897,14 +951,6 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
         }
     }
 
-    let addr = args.ticket.endpoint_addr();
-    tracing::info!("connecting to remote endpoint: {:?}", addr);
-    let connection = endpoint
-        .connect(addr.clone(), &args.common.alpn()?)
-        .await
-        .std_context("failed to connect to remote endpoint")?;
-    tracing::info!("connected to remote endpoint successfully");
-
     let unix_listener = UnixListener::bind(&socket_path)
         .with_std_context(|_| format!("failed to bind Unix socket at {socket_path:?}"))?;
     tracing::info!("bound local unix socket: {:?}", socket_path);
@@ -912,6 +958,21 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
     let _guard = UnixSocketGuard {
         path: socket_path.clone(),
     };
+
+    // Wait for our own endpoint to be ready before trying to connect, but only
+    // after the local Unix socket is bound so clients can queue while startup
+    // completes.
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+
+    let addr = endpoint_addr_from_ticket(&args.ticket, args.common.dht_only);
+    tracing::info!("connecting to remote endpoint: {:?}", addr);
+    let connection = endpoint
+        .connect(addr.clone(), &args.common.alpn()?)
+        .await
+        .std_context("failed to connect to remote endpoint")?;
+    tracing::info!("connected to remote endpoint successfully");
 
     async fn handle_unix_accept(
         next: io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
@@ -988,7 +1049,12 @@ async fn generate_ticket() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+        )
+        .init();
     let args = Args::parse();
     let res = match args.command {
         Commands::GenerateTicket => generate_ticket().await,

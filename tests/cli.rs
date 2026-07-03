@@ -39,6 +39,21 @@ fn read_ascii_lines(mut n: usize, reader: &mut impl Read) -> io::Result<Vec<u8>>
     Ok(res)
 }
 
+fn read_endpoint_ticket(reader: &mut impl Read) -> EndpointTicket {
+    loop {
+        let line = read_ascii_lines(1, reader).unwrap();
+        assert!(!line.is_empty(), "endpoint ticket was not printed");
+        let line = String::from_utf8(line).unwrap();
+        if let Some(ticket) = line
+            .split_ascii_whitespace()
+            .rev()
+            .find_map(|token| EndpointTicket::from_str(token).ok())
+        {
+            return ticket;
+        }
+    }
+}
+
 fn wait2() -> Arc<Barrier> {
     Arc::new(Barrier::new(2))
 }
@@ -64,11 +79,7 @@ fn connect_listen_happy() {
         .stderr_to_stdout() //
         .reader()
         .unwrap();
-    // read the first 3 lines of the header, and parse the last token as a ticket
-    let header = read_ascii_lines(3, &mut listen).unwrap();
-    let header = String::from_utf8(header).unwrap();
-    let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = read_endpoint_ticket(&mut listen);
 
     let connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
@@ -105,11 +116,7 @@ fn connect_listen_custom_alpn_happy() {
     .stderr_to_stdout() //
     .reader()
     .unwrap();
-    // read the first 3 lines of the header, and parse the last token as a ticket
-    let header = read_ascii_lines(3, &mut listen).unwrap();
-    let header = String::from_utf8(header).unwrap();
-    let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = read_endpoint_ticket(&mut listen);
 
     let connect = duct::cmd(
         dumbpipe_bin(),
@@ -149,11 +156,7 @@ fn connect_listen_ctrlc_connect() {
         .stderr_to_stdout() //
         .reader()
         .unwrap();
-    // read the first 3 lines of the header, and parse the last token as a ticket
-    let header = read_ascii_lines(3, &mut listen).unwrap();
-    let header = String::from_utf8(header).unwrap();
-    let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = read_endpoint_ticket(&mut listen);
 
     let mut connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
@@ -189,11 +192,7 @@ fn connect_listen_ctrlc_listen() {
         .stderr_to_stdout()
         .reader()
         .unwrap();
-    // read the first 3 lines of the header, and parse the last token as a ticket
-    let header = read_ascii_lines(3, &mut listen).unwrap();
-    let header = String::from_utf8(header).unwrap();
-    let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = read_endpoint_ticket(&mut listen);
 
     let mut connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
@@ -240,10 +239,7 @@ fn listen_tcp_happy() {
         .stderr_to_stdout() //
         .reader()
         .unwrap();
-    let header = read_ascii_lines(4, &mut listen_tcp).unwrap();
-    let header = String::from_utf8(header).unwrap();
-    let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = read_endpoint_ticket(&mut listen_tcp);
     // poke the listen-tcp process with a connect command
     let connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
@@ -267,10 +263,7 @@ fn connect_tcp_happy() {
         .stderr_to_stdout() //
         .reader()
         .unwrap();
-    let header = read_ascii_lines(3, &mut listen).unwrap();
-    let header = String::from_utf8(header).unwrap();
-    let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = read_endpoint_ticket(&mut listen);
     let ticket = ticket.to_string();
 
     // start a dumbpipe connect-tcp process
